@@ -103,5 +103,6 @@ class FrameTest {
         assertThrows(IllegalArgumentException.class, () -> new ProtocolLimits(0));
         assertThrows(IllegalArgumentException.class, () -> new ProtocolLimits(Integer.MAX_VALUE));
         assertEquals(4 * 1024 * 1024, ProtocolLimits.defaults().maxBodySize());
+        assertEquals(4 * 1024 * 1024 + 12, ProtocolLimits.defaults().maxFrameSize());
     }
 }

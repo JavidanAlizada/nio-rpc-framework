@@ -6,7 +6,23 @@ per milestone, not per commit.
 
 ## [Unreleased]
 
-Milestone 2 (NIO transport) is next.
+### Milestone 2 — NIO transport (in progress)
+
+- `dev.rpc.transport` API: `Transport` (bind, connect), `Server`,
+  `Connection` (write from any thread, `isWritable`, idempotent `close`),
+  and `ConnectionHandler`, whose events all run on the connection's
+  event-loop thread, with `onClosed` exactly once.
+- `TransportConfig` with validated defaults (none tuned from measurements):
+  - CPU-count event loops and 1,000 max connections;
+  - 256 KiB / 1 MiB watermarks and a 16 MiB write-queue limit;
+  - a 30 s idle timeout, with a PING after 15 s;
+  - a 5 s connect timeout and 100 ms to 10 s reconnect backoff;
+  - TCP_NODELAY on.
+- Config validation includes: the watermarks must be ordered, and the
+  write-queue limit must hold at least one largest legal frame
+  (`ProtocolLimits.maxFrameSize()`, new).
+- Checkstyle `ImportControl`: `transport` may not import `serialization`.
+- Version is `0.2.0-SNAPSHOT`.
 
 ## [0.1.0] — 2026-10-04
 
