@@ -16,6 +16,7 @@ class TransportConfigTest {
         var c = TransportConfig.defaults();
         assertEquals(Runtime.getRuntime().availableProcessors(), c.ioThreads());
         assertEquals(1_000, c.maxConnections());
+        assertEquals(1_024, c.acceptBacklog());
         assertEquals(256 * 1024, c.lowWatermark());
         assertEquals(1024 * 1024, c.highWatermark());
         assertEquals(16 * 1024 * 1024, c.writeQueueLimit());
@@ -33,6 +34,7 @@ class TransportConfigTest {
         var c = TransportConfig.builder()
                 .ioThreads(2)
                 .maxConnections(10)
+                .acceptBacklog(16)
                 .watermarks(10, 20, 64 * 1024)
                 .idleTimeout(Duration.ofMillis(400))
                 .connectTimeout(Duration.ofMillis(50))
@@ -42,6 +44,7 @@ class TransportConfigTest {
                 .build();
         assertEquals(2, c.ioThreads());
         assertEquals(10, c.maxConnections());
+        assertEquals(16, c.acceptBacklog());
         assertEquals(10, c.lowWatermark());
         assertEquals(20, c.highWatermark());
         assertEquals(64 * 1024, c.writeQueueLimit());
@@ -57,6 +60,7 @@ class TransportConfigTest {
     void countsMustBePositive() {
         rejects(b -> b.ioThreads(0), "ioThreads");
         rejects(b -> b.maxConnections(-1), "maxConnections");
+        rejects(b -> b.acceptBacklog(0), "acceptBacklog");
     }
 
     @Test

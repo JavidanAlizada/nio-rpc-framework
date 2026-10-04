@@ -13,6 +13,7 @@ import java.util.Objects;
 public record TransportConfig(
         int ioThreads,
         int maxConnections,
+        int acceptBacklog,
         int lowWatermark,
         int highWatermark,
         int writeQueueLimit,
@@ -26,6 +27,7 @@ public record TransportConfig(
     public TransportConfig {
         requirePositive("ioThreads", ioThreads);
         requirePositive("maxConnections", maxConnections);
+        requirePositive("acceptBacklog", acceptBacklog);
         requirePositive("lowWatermark", lowWatermark);
         if (!(lowWatermark < highWatermark && highWatermark < writeQueueLimit)) {
             throw new IllegalArgumentException("need lowWatermark < highWatermark < writeQueueLimit, got "
@@ -79,6 +81,9 @@ public record TransportConfig(
 
         private int ioThreads = Runtime.getRuntime().availableProcessors();
         private int maxConnections = 1_000;
+        // The OS clamps this to its own limit (kern.ipc.somaxconn is 128 on macOS; net.core.somaxconn is often
+        // 4096 on Linux). Java's own default of 50 resets connections under a modest connect burst.
+        private int acceptBacklog = 1_024;
         private int lowWatermark = 256 * 1024;
         private int highWatermark = 1024 * 1024;
         private int writeQueueLimit = 16 * 1024 * 1024;
@@ -99,6 +104,12 @@ public record TransportConfig(
 
         public Builder maxConnections(int maxConnections) {
             this.maxConnections = maxConnections;
+            return this;
+        }
+
+        /** Connections the kernel may queue before accept(); the OS caps it at its own maximum. */
+        public Builder acceptBacklog(int acceptBacklog) {
+            this.acceptBacklog = acceptBacklog;
             return this;
         }
 
@@ -137,8 +148,9 @@ public record TransportConfig(
         }
 
         public TransportConfig build() {
-            return new TransportConfig(ioThreads, maxConnections, lowWatermark, highWatermark, writeQueueLimit,
-                    idleTimeout, connectTimeout, reconnectBaseDelay, reconnectMaxDelay, tcpNoDelay, protocolLimits);
+            return new TransportConfig(ioThreads, maxConnections, acceptBacklog, lowWatermark, highWatermark,
+                    writeQueueLimit, idleTimeout, connectTimeout, reconnectBaseDelay, reconnectMaxDelay, tcpNoDelay,
+                    protocolLimits);
         }
     }
 }

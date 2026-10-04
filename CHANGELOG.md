@@ -34,6 +34,29 @@ per milestone, not per commit.
     never lost (checked by a race test).
   - Timers are ordered by `nanoTime` difference, which is safe across
     overflow, with FIFO order for ties.
+- `NioTransport`: the event-loop group plus `bind`/`connect`.
+  - **Server:** an acceptor thread per server, blocking in `accept()`,
+    hands channels to the loops round robin.
+  - **`maxConnections`:** an extra connection is accepted and closed at
+    once, because TCP can't refuse it earlier.
+  - **`acceptBacklog`** (new setting, default 1,024, clamped by the OS):
+    Java's default of 50 reset connections during a 200-connection burst.
+  - **Client:** non-blocking connect with a connect-timeout timer. The
+    connect future completes off the event loop, so a caller's `thenApply`
+    never runs on a loop thread.
+- `NioConnection`:
+  - **Read path:** the loop's shared read buffer feeds `FrameDecoder` and
+    then the handler, with at most 16 reads per wakeup.
+  - **Write queue:** a lock-free queue with a flush scheduled only on the
+    empty → non-empty transition. A partly written frame is resumed on the
+    next flush, and OP_WRITE is on only while data is left over.
+  - **Liveness:** PING is answered with PONG by the transport, and PONG
+    never reaches the handler.
+  - **Closing:** EOF, an I/O error, a protocol error or a throwing handler
+    closes the connection. `onClosed` fires exactly once, and only for
+    connections that opened; a failed connect fails its future instead.
+- `Transport.close()` stops the servers, closes every connection, stops the
+  loops, then sweeps any connection a racing `connect()` left behind.
 
 ## [0.1.0] — 2026-10-04
 
