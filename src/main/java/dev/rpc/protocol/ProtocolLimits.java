@@ -14,6 +14,11 @@ public record ProtocolLimits(int maxBodySize) {
         }
     }
 
+    /** The largest legal frame on the wire: header plus the largest body. */
+    public int maxFrameSize() {
+        return FrameFormat.HEADER_SIZE + maxBodySize;
+    }
+
     /** A 4 MiB body cap. */
     public static ProtocolLimits defaults() {
         return new ProtocolLimits(DEFAULT_MAX_BODY_SIZE);
