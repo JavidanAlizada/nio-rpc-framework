@@ -37,3 +37,9 @@ per milestone, not per commit.
   booleans and presence markers, duplicate map keys rejected.
 - Checkstyle `ImportControl`: `protocol` and `serialization` may not import
   each other.
+- `SchemaFingerprint.of(Type)`: the first 8 bytes of SHA-256 over a
+  canonical description of a type's wire structure (component names, types
+  and order, enum constant names, collection type arguments, boxed vs.
+  primitive). Record and enum type names are deliberately left out, so
+  renaming or moving a type stays compatible. Recursive and repeated records
+  become `ref N`. Unsupported types are rejected with the codec's own error.
