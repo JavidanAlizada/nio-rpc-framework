@@ -23,6 +23,17 @@ per milestone, not per commit.
   (`ProtocolLimits.maxFrameSize()`, new).
 - Checkstyle `ImportControl`: `transport` may not import `serialization`.
 - Version is `0.2.0-SNAPSHOT`.
+- `EventLoop`: one platform thread per reactor, owning a Selector, a
+  lock-free task queue (with `wakeup()` on every submit, so no lost
+  wakeups) and a loop-confined timer queue. Each iteration selects (with
+  a timeout from the next timer, rounded up so it never becomes "forever"),
+  dispatches ready keys, runs tasks, then runs due timers.
+  - Channels can only be registered on the loop thread.
+  - A failing task, timer or handler is logged and the loop continues.
+  - A task submitted while the loop shuts down either runs or is rejected,
+    never lost (checked by a race test).
+  - Timers are ordered by `nanoTime` difference, which is safe across
+    overflow, with FIFO order for ties.
 
 ## [0.1.0] — 2026-10-04
 
