@@ -56,6 +56,7 @@ spotbugs {
     toolVersion.set("4.8.6")
     effort.set(Effort.MAX)
     reportLevel.set(Confidence.MEDIUM)
+    excludeFilter.set(file("config/spotbugs/exclude.xml"))
 }
 
 tasks.spotbugsMain {

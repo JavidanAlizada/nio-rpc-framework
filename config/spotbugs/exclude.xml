@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Frames take ownership of their payload array instead of copying it on the
+  way in and out: copying would double the bytes copied per frame to guard
+  against a misuse no framework code does. The ownership rule is documented
+  on Frame. Scoped to the payload field of the two frame types that carry one.
+-->
+<FindBugsFilter>
+    <Match>
+        <Or>
+            <Class name="dev.rpc.protocol.Request"/>
+            <Class name="dev.rpc.protocol.Response"/>
+        </Or>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+        <Field name="payload"/>
+    </Match>
+</FindBugsFilter>
