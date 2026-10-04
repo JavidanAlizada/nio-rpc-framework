@@ -40,6 +40,10 @@
         <module name="LeftCurly"/>
         <module name="RightCurly"/>
 
+        <module name="ImportControl">
+            <property name="file" value="${config_loc}/import-control.xml"/>
+        </module>
+
         <module name="PackageDeclaration"/>
         <module name="OuterTypeFilename"/>
     </module>

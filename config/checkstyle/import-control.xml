@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<!DOCTYPE import-control PUBLIC
+    "-//Checkstyle//DTD ImportControl Configuration 1.4//EN"
+    "https://checkstyle.org/dtds/import_control_1_4.dtd">
+
+<!--
+  Layering rule from the design: frames carry bytes and know nothing about how
+  payloads are serialized, and the serializer knows nothing about frames. The
+  two only meet in the RPC core (Milestone 3). Everything not disallowed here
+  is allowed.
+-->
+<import-control pkg="dev.rpc" strategyOnMismatch="allowed">
+    <subpackage name="protocol">
+        <disallow pkg="dev.rpc.serialization"/>
+    </subpackage>
+    <subpackage name="serialization">
+        <disallow pkg="dev.rpc.protocol"/>
+    </subpackage>
+</import-control>

@@ -25,3 +25,15 @@ per milestone, not per commit.
 - Decoder tests: every single and every pair of split points, 1-byte
   chunks, 1,000 seeded random chunkings, hostile headers and bodies, and the
   tolerance rules.
+- `dev.rpc.serialization`: `Serializer` SPI and the built-in
+  `RecordSerializer`. Positional binary encoding of primitives and boxes,
+  String, byte[], enums, List, Map and records (recursive ones included),
+  with a 1-byte null marker on every reference-typed value. The codec tree
+  for a type is built once, eagerly (an unsupported type anywhere fails up
+  front and names its path, e.g. `NestedBad.bad.value`), and cached in a
+  `ClassValue`.
+- Hostile-input limits: collection counts checked against the bytes left
+  before allocating, nesting depth capped (default 64), strict UTF-8, strict
+  booleans and presence markers, duplicate map keys rejected.
+- Checkstyle `ImportControl`: `protocol` and `serialization` may not import
+  each other.
