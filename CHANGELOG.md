@@ -6,7 +6,11 @@ per milestone, not per commit.
 
 ## [Unreleased]
 
-### Milestone 1 — Wire protocol + codec (in progress)
+Milestone 2 (NIO transport) is next.
+
+## [0.1.0] — 2026-10-04
+
+### Milestone 1 — Wire protocol + codec
 
 - Gradle build: Java 21 toolchain, Checkstyle, SpotBugs, JaCoCo, PR CI.
 - `dev.rpc.protocol` frame types: sealed `Frame` with `Request`, `Response`,
@@ -43,3 +47,16 @@ per milestone, not per commit.
   primitive). Record and enum type names are deliberately left out, so
   renaming or moving a type stays compatible. Recursive and repeated records
   become `ref N`. Unsupported types are rejected with the codec's own error.
+- README: layers, protocol and compatibility rules, serialization,
+  concurrency, design patterns, security posture, and the trade-offs behind
+  each decision.
+
+### Scope notes
+
+- **No benchmarks.** No JMH and no load generator, by explicit decision.
+  The project therefore makes no performance claims, and the optimizations
+  deferred to Phase 2 (buffer pooling, zero-copy, batching) stay unjustified
+  until a benchmarking phase exists.
+- **No mutation testing** in Phase 1.
+- **No Dockerfile:** a library with nothing to run on its own.
+- **Phase 1 is plaintext and unauthenticated.** TLS is Phase 2.
