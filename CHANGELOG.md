@@ -16,3 +16,12 @@ per milestone, not per commit.
   fields, body cap from `ProtocolLimits` (default 4 MiB) checked before
   allocating, strict UTF-8 (a lone surrogate is an error, not a silent `?`).
 - Golden-byte tests pinning the wire format of every frame type.
+- `FrameDecoder`: two-state machine (header, body) plus a terminal FAILED
+  state; fed chunks of any size from 1 byte up. Version checked on the first
+  byte, body cap checked from the header before allocating, the fixed body
+  sizes of CANCEL/PING/PONG checked from the header, strict UTF-8, and a
+  `ProtocolException` for every malformed case. Unknown frame types are
+  skipped (and counted), unknown status codes kept.
+- Decoder tests: every single and every pair of split points, 1-byte
+  chunks, 1,000 seeded random chunkings, hostile headers and bodies, and the
+  tolerance rules.
