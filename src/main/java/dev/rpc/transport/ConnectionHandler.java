@@ -16,6 +16,10 @@ public interface ConnectionHandler {
     default void onWritabilityChanged(Connection connection, boolean writable) {
     }
 
-    /** Called exactly once per connection. cause is null when the connection was closed locally. */
+    /**
+     * Called exactly once per connection that opened. cause is null when the close was asked for locally, by
+     * Connection.close() or Transport.close(), even if the peer's FIN happened to be processed first; otherwise it
+     * says what ended the connection (EOF, an I/O or protocol error, a handler exception).
+     */
     void onClosed(Connection connection, Throwable cause);
 }
