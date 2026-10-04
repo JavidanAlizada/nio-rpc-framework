@@ -57,6 +57,12 @@ per milestone, not per commit.
     connections that opened; a failed connect fails its future instead.
 - `Transport.close()` stops the servers, closes every connection, stops the
   loops, then sweeps any connection a racing `connect()` left behind.
+- Close-cause contract: once a close was requested locally (`close()` or
+  `Transport.close()`), `onClosed` reports a `null` cause even if the
+  peer's FIN is processed first. `Transport.close()` marks every connection
+  before closing any, so two ends in one transport both report a local
+  close. Found by CI on Linux, where the FIN sometimes won the race; a
+  50-round regression test covers it.
 
 ## [0.1.0] — 2026-10-04
 

@@ -123,6 +123,9 @@ public final class NioTransport implements Transport {
             return;
         }
         servers.forEach(NioServer::close);
+        // Two passes: mark every connection first, so a connection whose peer (in this same transport) closes
+        // a moment earlier still reports a local close rather than the peer's EOF.
+        connections.forEach(NioConnection::markClosing);
         connections.forEach(NioConnection::close);
         for (EventLoop loop : loops) {
             loop.shutdown();

@@ -50,6 +50,9 @@ final class NioConnection implements Connection, IoHandler {
     private final Queue<ByteBuffer> writeQueue = new ConcurrentLinkedQueue<>();
     private final AtomicLong pendingBytes = new AtomicLong();
     private volatile boolean closing;
+    // Set once close() is asked for. From then on the connection counts as closed locally, even if the loop
+    // happens to see the peer's FIN first: that FIN is usually the peer reacting to our own close.
+    private volatile boolean closeRequested;
 
     // Loop thread only.
     private State state;
@@ -247,7 +250,14 @@ final class NioConnection implements Connection, IoHandler {
 
     @Override
     public void close() {
+        markClosing();
         closeWith(null);
+    }
+
+    /** Marks the connection as closed locally without closing it yet; NioTransport.close() marks all first. */
+    void markClosing() {
+        closeRequested = true;
+        closing = true;
     }
 
     void closeWith(Throwable cause) {
@@ -273,6 +283,7 @@ final class NioConnection implements Connection, IoHandler {
         }
         State was = state;
         state = State.CLOSED;
+        Throwable reported = closeRequested ? null : cause;
         closing = true;
         if (connectTimer != null) {
             connectTimer.cancel();
@@ -290,12 +301,12 @@ final class NioConnection implements Connection, IoHandler {
         transport.released(this);
         onRelease.run();
         if (was == State.CONNECTING) {
-            Throwable failure = cause != null ? cause : new ConnectionClosedException("closed while connecting");
+            Throwable failure = reported != null ? reported : new ConnectionClosedException("closed while connecting");
             Thread.ofVirtual().start(() -> connectFuture.completeExceptionally(failure));
             return;
         }
         try {
-            handler.onClosed(this, cause);
+            handler.onClosed(this, reported);
         } catch (RuntimeException e) {
             LOG.log(Level.WARNING, "onClosed handler failed", e);
         }

@@ -284,6 +284,26 @@ class NioTransportTest {
         assertThrows(IllegalStateException.class, () -> t.connect(server.localAddress(), new RecordingHandler()));
     }
 
+    @Test
+    void transportCloseReportsALocalCloseOnBothEndsEvenWhenThePeerClosesFirst() throws Exception {
+        // Both ends live in the same transport, so one side's close sends a FIN the other side may read before
+        // its own close task runs. CI on Linux hit exactly that; this repeats the race.
+        for (int round = 0; round < 50; round++) {
+            NioTransport t = new NioTransport(TransportConfig.builder().ioThreads(2).build());
+            var serverHandler = new RecordingHandler(echo()::onFrame);
+            Server server = t.bind(ANY_PORT, serverHandler);
+            var client = new RecordingHandler();
+            Connection c = connect(t, server, client);
+            c.write(request(1, new byte[0]));
+            client.take(WAIT);
+            t.close();
+            assertSame(RecordingHandler.LOCAL_CLOSE, client.closed.get(WAIT.toSeconds(), TimeUnit.SECONDS),
+                    "client, round " + round);
+            assertSame(RecordingHandler.LOCAL_CLOSE, serverHandler.closed.get(WAIT.toSeconds(), TimeUnit.SECONDS),
+                    "server, round " + round);
+        }
+    }
+
     // --- helpers ---
 
     private static Socket rawSocket(Server server) throws Exception {
