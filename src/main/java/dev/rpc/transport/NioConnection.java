@@ -20,6 +20,7 @@ import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -45,10 +46,19 @@ final class NioConnection implements Connection, IoHandler {
     private final SocketAddress remoteAddress;
     private final Runnable onRelease;
     private final CompletableFuture<Connection> connectFuture;
+    private final WriteWatermarks watermarks;
+    // Accepted (server-side) connections only; see writabilityChanged.
+    private final boolean pausesReads;
 
     // Written by any thread, drained by the loop.
     private final Queue<ByteBuffer> writeQueue = new ConcurrentLinkedQueue<>();
+    // Counted before a buffer is queued, so it may briefly over-report but never under-reports.
     private final AtomicLong pendingBytes = new AtomicLong();
+    // True while a flush is guaranteed to run: a flush task is queued, or OP_WRITE is on. Only the writer that
+    // flips it schedules one.
+    private final AtomicBoolean flushPending = new AtomicBoolean();
+    // Written by the loop only; false between crossing the high watermark and dropping below the low one.
+    private volatile boolean writable = true;
     private volatile boolean closing;
     // Set once close() is asked for. From then on the connection counts as closed locally, even if the loop
     // happens to see the peer's FIN first: that FIN is usually the peer reacting to our own close.
@@ -70,6 +80,8 @@ final class NioConnection implements Connection, IoHandler {
         this.remoteAddress = remoteAddress;
         this.onRelease = onRelease;
         this.connectFuture = connectFuture;
+        this.watermarks = WriteWatermarks.of(transport.config());
+        this.pausesReads = connectFuture == null;
         this.state = connectFuture == null ? State.OPEN : State.CONNECTING;
     }
 
@@ -141,7 +153,8 @@ final class NioConnection implements Connection, IoHandler {
     private void read() {
         ByteBuffer buf = loop.readBuffer();
         try {
-            for (int i = 0; i < MAX_READS_PER_WAKEUP && state == State.OPEN; i++) {
+            // A handler writing responses can make the connection unwritable mid-loop; then stop reading at once.
+            for (int i = 0; i < MAX_READS_PER_WAKEUP && state == State.OPEN && !readsPaused(); i++) {
                 buf.clear();
                 int n = channel.read(buf);
                 if (n < 0) {
@@ -194,24 +207,41 @@ final class NioConnection implements Connection, IoHandler {
             throw closedException();
         }
         ByteBuffer buf = encoder.encode(frame);
+        int size = buf.remaining();
+        long before = pendingBytes.getAndAdd(size);
+        long after = before + size;
+        if (watermarks.crossedLimit(before, after)) {
+            closeWith(new IOException("write queue overflow: " + after + " bytes pending, limit is "
+                    + watermarks.limit()));
+            throw closedException();
+        }
         writeQueue.add(buf);
-        // Only the write that finds the queue empty schedules a flush; any later one knows a flush is pending.
-        // The buffer is queued before the count goes up, so whoever sees a non-zero count also sees the buffer.
-        if (pendingBytes.getAndAdd(buf.remaining()) == 0) {
-            if (loop.inEventLoop()) {
-                flush();
-            } else {
-                try {
-                    loop.execute(this::flush);
-                } catch (RejectedExecutionException e) {
-                    throw closedException();
-                }
-            }
+        // Queued before the flag is read, so either this CAS wins and schedules a flush, or the flush that already
+        // owns the flag clears it before draining and so sees this buffer.
+        if (flushPending.compareAndSet(false, true)) {
+            runOnLoop(this::flush);
+        }
+        // Writability changes only on the loop, so a writer crossing the high watermark just asks it to look.
+        if (watermarks.crossedHigh(before, after)) {
+            runOnLoop(this::checkWatermarks);
+        }
+    }
+
+    private void runOnLoop(Runnable task) {
+        if (loop.inEventLoop()) {
+            task.run();
+            return;
+        }
+        try {
+            loop.execute(task);
+        } catch (RejectedExecutionException e) {
+            throw closedException();
         }
     }
 
     /** Writes queued frames until the socket is full; resumes inside a partly written frame on the next call. */
     private void flush() {
+        flushPending.set(false);
         if (state != State.OPEN) {
             return;
         }
@@ -220,21 +250,59 @@ final class NioConnection implements Connection, IoHandler {
             while ((buf = writeQueue.peek()) != null) {
                 channel.write(buf);
                 if (buf.hasRemaining()) {
-                    setWriteInterest(true);
-                    return;
+                    // OP_WRITE calls flush again, so writers needn't schedule one until then.
+                    flushPending.set(true);
+                    setInterest(SelectionKey.OP_WRITE, true);
+                    break;
                 }
                 writeQueue.poll();
                 pendingBytes.addAndGet(-buf.limit());
             }
-            setWriteInterest(false);
+            if (buf == null) {
+                setInterest(SelectionKey.OP_WRITE, false);
+            }
         } catch (IOException e) {
+            doClose(e);
+            return;
+        }
+        checkWatermarks();
+    }
+
+    /** Loop thread: applies a watermark crossing, if pendingBytes has made one since the last look. */
+    private void checkWatermarks() {
+        if (state != State.OPEN) {
+            return;
+        }
+        switch (watermarks.update(pendingBytes.get())) {
+            case UNWRITABLE -> writabilityChanged(false);
+            case WRITABLE -> writabilityChanged(true);
+            case NONE -> { }
+        }
+    }
+
+    private void writabilityChanged(boolean nowWritable) {
+        writable = nowWritable;
+        // On a server, every request read produces a response to the same peer, so a peer that doesn't read our
+        // writes doesn't get its requests read either; TCP then slows its sends down. A client must keep reading:
+        // its backlog is new calls, not answers, and if both ends stopped reading neither would ever drain.
+        if (pausesReads) {
+            setInterest(SelectionKey.OP_READ, nowWritable);
+        }
+        try {
+            handler.onWritabilityChanged(this, nowWritable);
+        } catch (RuntimeException e) {
+            LOG.log(Level.WARNING, "connection handler failed; closing " + remoteAddress, e);
             doClose(e);
         }
     }
 
-    private void setWriteInterest(boolean on) {
+    private boolean readsPaused() {
+        return pausesReads && !writable;
+    }
+
+    private void setInterest(int op, boolean on) {
         int ops = key.interestOps();
-        int wanted = on ? ops | SelectionKey.OP_WRITE : ops & ~SelectionKey.OP_WRITE;
+        int wanted = on ? ops | op : ops & ~op;
         if (wanted != ops) {
             key.interestOps(wanted);
         }
@@ -242,8 +310,7 @@ final class NioConnection implements Connection, IoHandler {
 
     @Override
     public boolean isWritable() {
-        // Backpressure watermarks come with the write-path milestone step; until then only closing matters.
-        return !closing;
+        return writable && !closing;
     }
 
     // --- closing ---

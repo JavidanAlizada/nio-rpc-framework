@@ -47,9 +47,20 @@ per milestone, not per commit.
 - `NioConnection`:
   - **Read path:** the loop's shared read buffer feeds `FrameDecoder` and
     then the handler, with at most 16 reads per wakeup.
-  - **Write queue:** a lock-free queue with a flush scheduled only on the
-    empty → non-empty transition. A partly written frame is resumed on the
-    next flush, and OP_WRITE is on only while data is left over.
+  - **Write queue:** a lock-free queue. A partly written frame is resumed
+    on the next flush, and OP_WRITE is on only while data is left over.
+    A flush is scheduled by whichever writer flips a `flushPending` flag;
+    the loop clears it before draining. This replaces #9's "schedule on
+    pendingBytes 0 → non-zero", which could strand a frame when the loop
+    drained a buffer before its writer had counted it.
+  - **Backpressure:** above the high watermark `isWritable()` turns false
+    and `onWritabilityChanged(false)` fires; below the low watermark both
+    revert. Events fire only on the loop thread. Above the hard limit the
+    connection closes with a "write queue overflow" cause, and the write
+    that crossed it throws `ConnectionClosedException`.
+  - **Pausing reads** while unwritable applies to accepted (server)
+    connections only. On a client it deadlocked: both ends stopped reading
+    and neither queue could drain.
   - **Liveness:** PING is answered with PONG by the transport, and PONG
     never reaches the handler.
   - **Closing:** EOF, an I/O error, a protocol error or a throwing handler
