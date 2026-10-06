@@ -19,6 +19,8 @@ import dev.rpc.protocol.ProtocolLimits;
 import dev.rpc.protocol.Request;
 import dev.rpc.protocol.Response;
 import java.io.EOFException;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.io.InputStream;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
@@ -163,6 +165,156 @@ class NioTransportTest {
             assertEquals(new Pong(0x1122334455667788L), reply);
         }
         assertTrue(serverHandler.frames.isEmpty());
+    }
+
+    // --- writing and backpressure ---
+
+    @Test
+    void concurrentWritersNeverInterleaveInsideAFrame() throws Exception {
+        NioTransport t = transport();
+        Server server = t.bind(ANY_PORT, echo());
+        var client = new RecordingHandler();
+        Connection c = connect(t, server, client);
+
+        int writers = 64;
+        int perWriter = 200;
+        List<Thread> threads = new ArrayList<>();
+        for (int w = 0; w < writers; w++) {
+            int writer = w;
+            threads.add(Thread.ofVirtual().start(() -> {
+                for (int seq = 0; seq < perWriter; seq++) {
+                    // requestId 0 is reserved, hence writer + 1.
+                    c.write(request((writer + 1) * 1_000 + seq, payloadFor(writer, seq)));
+                }
+            }));
+        }
+        for (Thread thread : threads) {
+            thread.join(WAIT.toMillis());
+        }
+
+        int[] nextSeq = new int[writers];
+        for (int i = 0; i < writers * perWriter; i++) {
+            Response r = (Response) client.take(WAIT);
+            int writer = r.requestId() / 1_000 - 1;
+            int seq = r.requestId() % 1_000;
+            assertEquals(nextSeq[writer]++, seq, "writer " + writer + "'s frames out of order");
+            assertArrayEquals(payloadFor(writer, seq), r.payload(), "frame " + r.requestId() + " corrupted");
+        }
+    }
+
+    @Test
+    void aPeerWithATinyReceiveWindowGetsEveryByte() throws Exception {
+        NioTransport t = transport();
+        Server server = t.bind(ANY_PORT, echo());
+        // A 4 KiB receive window lets the server's socket take only a sliver of each 1 MiB frame per write, so
+        // every frame goes out through many partial writes resumed via OP_WRITE.
+        try (Socket raw = new Socket()) {
+            raw.setReceiveBufferSize(4 * 1024);
+            raw.connect(server.localAddress(), 5_000);
+            raw.setSoTimeout(10_000);
+            byte[] big = payloadFor(7, 1 << 20);
+            // Sent from another thread: the server stops reading while its replies back up, so a peer that
+            // wrote everything before reading would block forever, which is backpressure doing its job.
+            var sender = Thread.ofVirtual().start(() -> {
+                try {
+                    for (int i = 1; i <= 3; i++) {
+                        raw.getOutputStream().write(bytes(request(i, big)));
+                    }
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+            List<Frame> replies = readFrames(raw, 3);
+            sender.join(WAIT.toMillis());
+            for (int i = 1; i <= 3; i++) {
+                Response r = (Response) replies.get(i - 1);
+                assertEquals(i, r.requestId());
+                assertArrayEquals(big, r.payload());
+            }
+        }
+    }
+
+    @Test
+    void aPeerThatStopsReadingStopsBeingReadFromUntilItCatchesUp() throws Exception {
+        NioTransport t = transport(TransportConfig.builder()
+                .ioThreads(1)
+                .watermarks(16 * 1024, 64 * 1024, 16 * 1024 * 1024)
+                .build());
+        var serverHandler = new RecordingHandler(echo()::onFrame);
+        Server server = t.bind(ANY_PORT, serverHandler);
+        try (Socket raw = new Socket()) {
+            raw.setReceiveBufferSize(16 * 1024);
+            raw.connect(server.localAddress(), 5_000);
+            raw.setSoTimeout(10_000);
+
+            // 32 MiB of requests: far more than the kernel buffers on both sides can hold, so this thread blocks
+            // once the server stops reading, and finishes only after the reader below catches up.
+            int requests = 4_000;
+            byte[] payload = new byte[8 * 1024];
+            var sender = Thread.ofVirtual().start(() -> {
+                try {
+                    for (int i = 1; i <= requests; i++) {
+                        raw.getOutputStream().write(bytes(request(i, payload)));
+                    }
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+
+            assertEquals(false, serverHandler.nextWritability(WAIT));
+            Connection serverSide = serverHandler.firstConnection.get();
+            assertTrue(!serverSide.isWritable());
+            // Reading is paused: once the read pass in flight is over, no more requests reach the handler.
+            Thread.sleep(200);
+            int seen = serverHandler.frames.size();
+            Thread.sleep(500);
+            assertEquals(seen, serverHandler.frames.size(), "server kept reading from a peer that doesn't read");
+            assertTrue(seen < requests);
+
+            // Now the peer reads: the server drains below the low watermark and reads again, so every request
+            // is eventually answered.
+            List<Frame> replies = readFrames(raw, requests);
+            sender.join(WAIT.toMillis());
+            assertEquals(requests, ((Response) replies.get(requests - 1)).requestId());
+            assertEquals(true, serverHandler.nextWritability(WAIT));
+            for (String thread : serverHandler.writabilityThreads) {
+                assertTrue(thread.contains("-loop-"), "writability event on " + thread);
+            }
+        }
+    }
+
+    @Test
+    void theHardLimitClosesTheConnection() throws Exception {
+        int maxBody = 64 * 1024;
+        NioTransport t = transport(TransportConfig.builder()
+                .ioThreads(1)
+                .protocolLimits(new ProtocolLimits(maxBody))
+                .watermarks(16 * 1024, 64 * 1024, 1024 * 1024)
+                .build());
+        // On the first request, write responses without ever checking isWritable(), as a buggy caller would.
+        var writerFailure = new CompletableFuture<Throwable>();
+        var serverHandler = new RecordingHandler((c, f) -> Thread.ofVirtual().start(() -> {
+            try {
+                for (int i = 1; i <= 100_000; i++) {
+                    c.write(Response.ok(i, new byte[maxBody - 100]));
+                }
+                writerFailure.complete(null);
+            } catch (Throwable e) {
+                writerFailure.complete(e);
+            }
+        }));
+        Server server = t.bind(ANY_PORT, serverHandler);
+        try (Socket raw = new Socket()) {
+            raw.setReceiveBufferSize(16 * 1024);
+            raw.connect(server.localAddress(), 5_000);
+            raw.getOutputStream().write(bytes(request(1, new byte[0])));
+
+            assertInstanceOf(ConnectionClosedException.class, writerFailure.get(WAIT.toSeconds(), TimeUnit.SECONDS));
+            Throwable cause = serverHandler.closed.get(WAIT.toSeconds(), TimeUnit.SECONDS);
+            assertInstanceOf(IOException.class, cause);
+            assertTrue(cause.getMessage().startsWith("write queue overflow"), cause.getMessage());
+            assertEquals(1, serverHandler.closeCount.get());
+        }
     }
 
     // --- closing ---
@@ -324,6 +476,30 @@ class NioTransportTest {
         byte[] out = new byte[buf.remaining()];
         buf.get(out);
         return out;
+    }
+
+    /** Bytes that depend on both values, so a shifted, dropped or misrouted byte shows up as a mismatch. */
+    private static byte[] payloadFor(int writer, int seq) {
+        byte[] out = new byte[seq < 1_000 ? (seq * 37) % 1_024 : seq];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) (writer * 31 + seq * 7 + i);
+        }
+        return out;
+    }
+
+    private static List<Frame> readFrames(Socket raw, int n) throws Exception {
+        InputStream in = raw.getInputStream();
+        var decoder = new FrameDecoder();
+        List<Frame> frames = new ArrayList<>(n);
+        byte[] chunk = new byte[64 * 1024];
+        while (frames.size() < n) {
+            int read = in.read(chunk);
+            if (read < 0) {
+                throw new EOFException("socket closed after " + frames.size() + " of " + n + " frames");
+            }
+            decoder.decode(ByteBuffer.wrap(chunk, 0, read), frames::add);
+        }
+        return frames;
     }
 
     private static Frame readFrame(Socket raw) throws Exception {

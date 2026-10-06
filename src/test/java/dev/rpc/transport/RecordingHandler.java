@@ -18,6 +18,8 @@ final class RecordingHandler implements ConnectionHandler {
     final AtomicInteger closeCount = new AtomicInteger();
     final CompletableFuture<Throwable> closed = new CompletableFuture<>();
     final CompletableFuture<Connection> firstConnection = new CompletableFuture<>();
+    final BlockingQueue<Boolean> writability = new LinkedBlockingQueue<>();
+    final BlockingQueue<String> writabilityThreads = new LinkedBlockingQueue<>();
     private final BiConsumer<Connection, Frame> onFrame;
 
     RecordingHandler() {
@@ -33,6 +35,12 @@ final class RecordingHandler implements ConnectionHandler {
         firstConnection.complete(connection);
         frames.add(frame);
         onFrame.accept(connection, frame);
+    }
+
+    @Override
+    public void onWritabilityChanged(Connection connection, boolean writable) {
+        writabilityThreads.add(Thread.currentThread().getName());
+        writability.add(writable);
     }
 
     @Override
@@ -56,6 +64,14 @@ final class RecordingHandler implements ConnectionHandler {
             out.add(take(timeout));
         }
         return out;
+    }
+
+    boolean nextWritability(Duration timeout) throws InterruptedException {
+        Boolean w = writability.poll(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        if (w == null) {
+            throw new AssertionError("no writability change within " + timeout);
+        }
+        return w;
     }
 
     static final Throwable LOCAL_CLOSE = new Throwable("closed locally");
