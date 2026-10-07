@@ -63,6 +63,16 @@ per milestone, not per commit.
     and neither queue could drain.
   - **Liveness:** PING is answered with PONG by the transport, and PONG
     never reaches the handler.
+  - **Idle detection:** after idleTimeout/2 with nothing read, the
+    connection sends a PING carrying `System.nanoTime()`; after idleTimeout
+    it closes with a `SocketTimeoutException("idle timeout …")` cause. Any
+    inbound byte resets it, on clients and servers alike. One timer per
+    connection re-arms itself; reads only update a timestamp.
+  - While a server connection has paused reads for backpressure, bytes the
+    peer's socket accepts from our queue count as life too, since no read
+    can. How quickly that progress shows depends on kernel buffer sizes:
+    with the 30 s default, a peer reading faster than roughly 20 KB/s
+    counts as alive.
   - **Closing:** EOF, an I/O error, a protocol error or a throwing handler
     closes the connection. `onClosed` fires exactly once, and only for
     connections that opened; a failed connect fails its future instead.

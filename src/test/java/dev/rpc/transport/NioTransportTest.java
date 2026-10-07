@@ -23,7 +23,9 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.io.InputStream;
 import java.net.ConnectException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.ByteBuffer;
@@ -165,6 +167,88 @@ class NioTransportTest {
             assertEquals(new Pong(0x1122334455667788L), reply);
         }
         assertTrue(serverHandler.frames.isEmpty());
+    }
+
+    // --- idle detection ---
+
+    private static final Duration IDLE = Duration.ofMillis(400);
+
+    private NioTransport idleTransport() {
+        return transport(TransportConfig.builder().ioThreads(1).idleTimeout(IDLE).build());
+    }
+
+    private static void assertIdleTimeout(RecordingHandler handler) throws Exception {
+        Throwable cause = handler.closed.get(WAIT.toSeconds(), TimeUnit.SECONDS);
+        assertInstanceOf(SocketTimeoutException.class, cause);
+        assertTrue(cause.getMessage().startsWith("idle timeout"), cause.getMessage());
+        assertEquals(1, handler.closeCount.get());
+    }
+
+    @Test
+    void aSilentClientIsPingedThenClosed() throws Exception {
+        NioTransport t = idleTransport();
+        var serverHandler = new RecordingHandler();
+        Server server = t.bind(ANY_PORT, serverHandler);
+        long start = System.nanoTime();
+        try (Socket raw = rawSocket(server)) {
+            // The PING carries the server's nanoTime; same JVM, so it shows the server waited before pinging.
+            Ping ping = (Ping) readFrame(raw);
+            assertTrue(ping.payload() - start >= IDLE.dividedBy(2).toNanos(), "pinged too early");
+            assertEquals(-1, raw.getInputStream().read());
+            assertTrue(System.nanoTime() - start >= IDLE.toNanos(), "closed too early");
+        }
+        assertIdleTimeout(serverHandler);
+    }
+
+    @Test
+    void aSilentServerIsPingedThenClosed() throws Exception {
+        NioTransport t = idleTransport();
+        try (ServerSocket rawServer = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            var client = new RecordingHandler();
+            t.connect(rawServer.getLocalSocketAddress(), client).get(WAIT.toSeconds(), TimeUnit.SECONDS);
+            try (Socket raw = rawServer.accept()) {
+                raw.setSoTimeout(10_000);
+                assertInstanceOf(Ping.class, readFrame(raw));
+                assertEquals(-1, raw.getInputStream().read());
+            }
+            assertIdleTimeout(client);
+        }
+    }
+
+    @Test
+    void aPeerThatAnswersPingsStaysOpen() throws Exception {
+        NioTransport t = idleTransport();
+        var serverHandler = new RecordingHandler();
+        Server server = t.bind(ANY_PORT, serverHandler);
+        try (Socket raw = rawSocket(server)) {
+            // Five pings at least idle/2 apart span 2.5 idle timeouts; without the PONGs it'd be closed after one.
+            for (int i = 0; i < 5; i++) {
+                Ping ping = (Ping) readFrame(raw);
+                raw.getOutputStream().write(bytes(new Pong(ping.payload())));
+            }
+            assertTrue(!serverHandler.closed.isDone(), "closed a peer that answered every PING");
+        }
+    }
+
+    @Test
+    void aPeerThatKeepsSendingIsNeverPinged() throws Exception {
+        NioTransport t = idleTransport();
+        var serverHandler = new RecordingHandler();
+        Server server = t.bind(ANY_PORT, serverHandler);
+        try (Socket raw = rawSocket(server)) {
+            long lastSend = 0;
+            // Paced at a quarter of the ping interval, for three idle timeouts. The sleep is the traffic pattern
+            // under test, not a wait for something to happen.
+            for (int i = 1; i <= 24; i++) {
+                lastSend = System.nanoTime();
+                raw.getOutputStream().write(bytes(request(i, new byte[0])));
+                Thread.sleep(IDLE.toMillis() / 8);
+            }
+            // The handler doesn't reply, so the first frame back must be a PING sent only once we went quiet.
+            Ping ping = (Ping) readFrame(raw);
+            assertTrue(ping.payload() - lastSend >= IDLE.dividedBy(2).toNanos(), "pinged while the peer was sending");
+        }
+        assertEquals(24, serverHandler.frames.size());
     }
 
     // --- writing and backpressure ---
