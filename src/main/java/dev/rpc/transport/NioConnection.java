@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.lang.System.Logger.Level;
 import java.net.ConnectException;
 import java.net.SocketAddress;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
@@ -47,6 +48,8 @@ final class NioConnection implements Connection, IoHandler {
     private final Runnable onRelease;
     private final CompletableFuture<Connection> connectFuture;
     private final WriteWatermarks watermarks;
+    private final Duration idleTimeout;
+    private final Duration pingAfter;
     // Accepted (server-side) connections only; see writabilityChanged.
     private final boolean pausesReads;
 
@@ -68,6 +71,10 @@ final class NioConnection implements Connection, IoHandler {
     private State state;
     private SelectionKey key;
     private EventLoop.Timer connectTimer;
+    private EventLoop.Timer idleTimer;
+    // nanoTime of the last sign of life from the peer, and whether we've pinged it since.
+    private long lastActivity;
+    private boolean pinged;
 
     NioConnection(NioTransport transport, EventLoop loop, SocketChannel channel, ConnectionHandler handler,
             SocketAddress remoteAddress, Runnable onRelease, CompletableFuture<Connection> connectFuture) {
@@ -81,6 +88,8 @@ final class NioConnection implements Connection, IoHandler {
         this.onRelease = onRelease;
         this.connectFuture = connectFuture;
         this.watermarks = WriteWatermarks.of(transport.config());
+        this.idleTimeout = transport.config().idleTimeout();
+        this.pingAfter = transport.config().pingAfter();
         this.pausesReads = connectFuture == null;
         this.state = connectFuture == null ? State.OPEN : State.CONNECTING;
     }
@@ -91,6 +100,7 @@ final class NioConnection implements Connection, IoHandler {
     void openAccepted() {
         try {
             key = loop.register(channel, SelectionKey.OP_READ, this);
+            startIdleTimer();
         } catch (IOException | RuntimeException e) {
             doClose(e);
         }
@@ -122,6 +132,7 @@ final class NioConnection implements Connection, IoHandler {
             connectTimer.cancel();
         }
         state = State.OPEN;
+        startIdleTimer();
         // Completed off the loop: a caller's thenApply would otherwise run their code on the event loop.
         Thread.ofVirtual().start(() -> connectFuture.complete(this));
     }
@@ -164,6 +175,7 @@ final class NioConnection implements Connection, IoHandler {
                 if (n == 0) {
                     return;
                 }
+                sawLife();
                 buf.flip();
                 decoder.decode(buf, this::onFrame);
             }
@@ -185,7 +197,7 @@ final class NioConnection implements Connection, IoHandler {
                 }
             }
             case Pong pong -> {
-                // Liveness only; any inbound byte already counts.
+                // Liveness only; the read that brought it already counted.
             }
             default -> {
                 try {
@@ -196,6 +208,45 @@ final class NioConnection implements Connection, IoHandler {
                 }
             }
         }
+    }
+
+    // --- liveness (loop thread) ---
+
+    private void startIdleTimer() {
+        lastActivity = System.nanoTime();
+        idleTimer = loop.schedule(this::checkIdle, pingAfter);
+    }
+
+    private void sawLife() {
+        lastActivity = System.nanoTime();
+        pinged = false;
+    }
+
+    /**
+     * One timer per connection, re-armed from here rather than on every read: reads only move lastActivity, and
+     * the timer, when it fires, works out whether to ping, close, or just look again later.
+     */
+    private void checkIdle() {
+        if (state != State.OPEN) {
+            return;
+        }
+        long now = System.nanoTime();
+        long quiet = now - lastActivity;
+        if (quiet >= idleTimeout.toNanos()) {
+            doClose(new SocketTimeoutException(
+                    "idle timeout: nothing heard from the peer for " + idleTimeout.toMillis() + " ms"));
+            return;
+        }
+        if (!pinged && quiet >= pingAfter.toNanos()) {
+            pinged = true;
+            try {
+                write(new Ping(now));
+            } catch (ConnectionClosedException e) {
+                return;
+            }
+        }
+        long next = lastActivity + (pinged ? idleTimeout : pingAfter).toNanos();
+        idleTimer = loop.schedule(this::checkIdle, Duration.ofNanos(next - now));
     }
 
     // --- writing ---
@@ -247,8 +298,9 @@ final class NioConnection implements Connection, IoHandler {
         }
         try {
             ByteBuffer buf;
+            boolean wrote = false;
             while ((buf = writeQueue.peek()) != null) {
-                channel.write(buf);
+                wrote |= channel.write(buf) > 0;
                 if (buf.hasRemaining()) {
                     // OP_WRITE calls flush again, so writers needn't schedule one until then.
                     flushPending.set(true);
@@ -257,6 +309,11 @@ final class NioConnection implements Connection, IoHandler {
                 }
                 writeQueue.poll();
                 pendingBytes.addAndGet(-buf.limit());
+            }
+            if (readsPaused() && wrote) {
+                // We aren't reading, so inbound bytes can't prove the peer is alive. Its kernel taking more of
+                // our backlog can: a stuck peer's receive window stays full and our writes stop moving.
+                sawLife();
             }
             if (buf == null) {
                 setInterest(SelectionKey.OP_WRITE, false);
@@ -354,6 +411,9 @@ final class NioConnection implements Connection, IoHandler {
         closing = true;
         if (connectTimer != null) {
             connectTimer.cancel();
+        }
+        if (idleTimer != null) {
+            idleTimer.cancel();
         }
         if (key != null) {
             key.cancel();
