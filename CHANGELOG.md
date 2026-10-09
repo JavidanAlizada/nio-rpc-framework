@@ -6,7 +6,9 @@ per milestone, not per commit.
 
 ## [Unreleased]
 
-### Milestone 2 — NIO transport (in progress)
+## [0.2.0] — 2026-10-09
+
+### Milestone 2 — NIO transport
 
 - `dev.rpc.transport` API: `Transport` (bind, connect), `Server`,
   `Connection` (write from any thread, `isWritable`, idempotent `close`),
@@ -112,6 +114,13 @@ per milestone, not per commit.
     `onClosed` fires once with a local cause, both reconnecting
     connections end CLOSED, and no `rpc-N-` thread is left alive.
   - No transport bugs found.
+- README: a Transport section with the threading and ownership diagram,
+  the write path and backpressure, PING/PONG liveness versus TCP
+  keepalive, reconnecting, close semantics, the worst-case memory bound
+  (20 GiB with the defaults), and every default with its reasoning.
+  Concurrency, Design patterns, Security and Build & test sections
+  updated.
+- Version `0.2.0`.
 
 ## [0.1.0] — 2026-10-04
 
