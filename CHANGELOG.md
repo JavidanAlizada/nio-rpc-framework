@@ -84,6 +84,20 @@ per milestone, not per commit.
   before closing any, so two ends in one transport both report a local
   close. Found by CI on Linux, where the FIN sometimes won the race; a
   50-round regression test covers it.
+- `ReconnectingConnection`, from `NioTransport.reconnecting(address,
+  handler)`: keeps one connection open to an endpoint.
+  - **States:** CONNECTING, CONNECTED, BACKING_OFF and CLOSED, read with
+    `state()`.
+  - **Backoff:** when a connection closes or a connect fails, it waits
+    with exponential backoff and full jitter (100 ms to 10 s from
+    `TransportConfig`), then tries again. The attempt count resets on a
+    successful connect.
+  - **Retry timers** run on the transport's event loops, so there's no extra
+    scheduler thread, and `Transport.close()` closes these connections too.
+  - **`write()` fails fast** with `ConnectionClosedException` unless
+    CONNECTED, and nothing is queued.
+  - **The handler** sees each underlying connection's events, so
+    `onClosed` fires once per connection that opened.
 
 ## [0.1.0] — 2026-10-04
 
