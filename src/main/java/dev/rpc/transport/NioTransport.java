@@ -34,6 +34,7 @@ public final class NioTransport implements Transport {
     private final AtomicInteger nextLoop = new AtomicInteger();
     private final Set<NioConnection> connections = ConcurrentHashMap.newKeySet();
     private final Set<NioServer> servers = ConcurrentHashMap.newKeySet();
+    private final Set<ReconnectingConnection> reconnecting = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean closed = new AtomicBoolean();
 
     public NioTransport() {
@@ -90,6 +91,21 @@ public final class NioTransport implements Transport {
         return future;
     }
 
+    /**
+     * A connection to address that reconnects by itself, with the backoff from TransportConfig. It starts connecting
+     * at once; state() shows when it's CONNECTED. Closing the transport closes it too.
+     */
+    public ReconnectingConnection reconnecting(SocketAddress address, ConnectionHandler handler) {
+        Objects.requireNonNull(address, "address");
+        Objects.requireNonNull(handler, "handler");
+        checkOpen();
+        var connection = new ReconnectingConnection(this, address, handler,
+                new Backoff(config.reconnectBaseDelay(), config.reconnectMaxDelay()));
+        reconnecting.add(connection);
+        connection.start();
+        return connection;
+    }
+
     /** Takes over a freshly accepted channel. release runs once the connection is closed. */
     void adopt(SocketChannel channel, ConnectionHandler handler, Runnable release) {
         SocketAddress remote;
@@ -123,6 +139,8 @@ public final class NioTransport implements Transport {
             return;
         }
         servers.forEach(NioServer::close);
+        // Before the connection sweep, so none of them starts another attempt.
+        reconnecting.forEach(ReconnectingConnection::close);
         // Two passes: mark every connection first, so a connection whose peer (in this same transport) closes
         // a moment earlier still reports a local close rather than the peer's EOF.
         connections.forEach(NioConnection::markClosing);
@@ -160,6 +178,15 @@ public final class NioTransport implements Transport {
 
     void serverClosed(NioServer server) {
         servers.remove(server);
+    }
+
+    void reconnectingClosed(ReconnectingConnection connection) {
+        reconnecting.remove(connection);
+    }
+
+    /** Runs task on one of the loops after delay. Throws RejectedExecutionException once the transport is closing. */
+    EventLoop.Timer schedule(Runnable task, Duration delay) {
+        return nextLoop().schedule(task, delay);
     }
 
     private EventLoop nextLoop() {
