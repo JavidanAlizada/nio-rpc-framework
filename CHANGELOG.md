@@ -98,6 +98,20 @@ per milestone, not per commit.
     CONNECTED, and nothing is queued.
   - **The handler** sees each underlying connection's events, so
     `onClosed` fires once per connection that opened.
+- Failure and shutdown suite (`FailureAndShutdownTest`), with no fixed
+  sleeps:
+  - A peer that sends a FIN or an RST in the middle of a frame: closed
+    once, and the truncated frame is never delivered.
+  - A throwing handler closes only its own connection; another
+    connection on the same loop keeps working.
+  - Under `maxConnections`, a closed connection gives its slot back.
+  - 32 threads call `close()` while the peer closes too, for 30 rounds:
+    `onClosed` fires exactly once on each end.
+  - `Transport.close()` with two servers, 20 connections across 4 loops,
+    and two reconnecting connections (one up, one backing off): every
+    `onClosed` fires once with a local cause, both reconnecting
+    connections end CLOSED, and no `rpc-N-` thread is left alive.
+  - No transport bugs found.
 
 ## [0.1.0] — 2026-10-04
 
