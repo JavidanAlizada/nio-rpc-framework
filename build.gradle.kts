@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "dev.rpc"
-version = "0.2.0-SNAPSHOT"
+version = "0.2.0"
 
 java {
     toolchain {
