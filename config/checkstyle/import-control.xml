@@ -7,17 +7,21 @@
   Layering rule from the design: frames carry bytes and know nothing about how
   payloads are serialized, and the serializer knows nothing about frames. The
   two only meet in the RPC core (Milestone 3). The transport moves frames and
-  never sees payloads, so it may use protocol but not serialization.
+  never sees payloads, so it may use protocol but not serialization. The
+  core sits on top of all three, and none of them may reach back up into it.
   Everything not disallowed here is allowed.
 -->
 <import-control pkg="dev.rpc" strategyOnMismatch="allowed">
     <subpackage name="protocol">
+        <disallow pkg="dev.rpc.core"/>
         <disallow pkg="dev.rpc.serialization"/>
     </subpackage>
     <subpackage name="serialization">
+        <disallow pkg="dev.rpc.core"/>
         <disallow pkg="dev.rpc.protocol"/>
     </subpackage>
     <subpackage name="transport">
+        <disallow pkg="dev.rpc.core"/>
         <disallow pkg="dev.rpc.serialization"/>
     </subpackage>
 </import-control>
