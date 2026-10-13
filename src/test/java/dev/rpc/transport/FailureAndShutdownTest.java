@@ -8,6 +8,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import dev.rpc.protocol.Frame;
 import dev.rpc.protocol.FrameDecoder;
 import dev.rpc.protocol.FrameEncoder;
+import dev.rpc.protocol.Ping;
+import dev.rpc.protocol.Pong;
 import dev.rpc.protocol.Request;
 import dev.rpc.protocol.Response;
 import java.io.EOFException;
@@ -94,6 +96,10 @@ class FailureAndShutdownTest {
         Server server = t.bind(ANY_PORT, serverHandler);
         byte[] frame = bytes(request(1, new byte[10_000]));
         try (Socket raw = rawSocket(server)) {
+            // A PONG proves the server accepted the connection. Reset while it's still in the accept backlog and
+            // the kernel may drop it before accept(), so the server never opens it and onClosed never fires.
+            raw.getOutputStream().write(bytes(new Ping(1)));
+            assertEquals(new Pong(1), readFrame(raw));
             raw.getOutputStream().write(frame, 0, 20);
             raw.getOutputStream().flush();
             // Linger 0 turns close() into an RST instead of a FIN.
