@@ -14,6 +14,8 @@ import dev.rpc.transport.ReconnectingConnection;
 import java.lang.reflect.Proxy;
 import java.net.SocketAddress;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
@@ -24,6 +26,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Calls one server endpoint through stubs of its service interfaces. Every stub shares one connection, which
@@ -41,6 +44,7 @@ public final class RpcClient implements AutoCloseable {
     private final Serializer serializer;
     private final int maxInFlight;
     private final Duration defaultTimeout;
+    private final List<ClientInterceptor> interceptors;
     private final ScheduledExecutorService timers = Timers.create("rpc-client-deadlines");
     private final ReconnectingConnection connection;
     // One table per physical connection: a call must wait in the table of the connection it was written to.
@@ -52,6 +56,7 @@ public final class RpcClient implements AutoCloseable {
         this.serializer = builder.serializer;
         this.maxInFlight = builder.maxInFlight;
         this.defaultTimeout = builder.defaultTimeout;
+        this.interceptors = List.copyOf(builder.interceptors);
         ThreadFactory threads = Thread.ofVirtual().name("rpc-complete-", 0).factory();
         this.completer = task -> threads.newThread(task).start();
         this.connection = builder.transport.reconnecting(builder.address, new Handler());
@@ -99,8 +104,41 @@ public final class RpcClient implements AutoCloseable {
         return "RpcClient[" + connection.remoteAddress() + "]";
     }
 
-    /** Sends one call; deadline may be null. Never throws; every failure comes back through the future. */
-    CompletableFuture<Object> call(MethodDescriptor method, Object[] args, Deadline deadline) {
+    /** Runs one call through the interceptors. Never throws; every failure comes back through the future. */
+    CompletableFuture<Object> invoke(MethodDescriptor method, ClientCall call, Object[] args) {
+        // The request on the wire right now. An interceptor may retry, so cancelling the call cancels whichever
+        // attempt is current, whatever future the chain handed back.
+        var attempt = new AtomicReference<CompletableFuture<Object>>();
+        CompletableFuture<Object> result = proceed(0, method, call, args, attempt);
+        result.whenComplete((r, e) -> {
+            CompletableFuture<Object> current = attempt.get();
+            if (result.isCancelled() && current != null) {
+                current.cancel(false);
+            }
+        });
+        return result;
+    }
+
+    private CompletableFuture<Object> proceed(int index, MethodDescriptor method, ClientCall call, Object[] args,
+            AtomicReference<CompletableFuture<Object>> attempt) {
+        if (index == interceptors.size()) {
+            CompletableFuture<Object> sent = send(method, args, call.deadline(), call.headers());
+            attempt.set(sent);
+            return sent;
+        }
+        try {
+            CompletableFuture<Object> result = interceptors.get(index).intercept(call, args,
+                    (c, a) -> proceed(index + 1, method, Objects.requireNonNull(c, "call"), a, attempt));
+            return result != null ? result : CompletableFuture.failedFuture(
+                    new NullPointerException(interceptors.get(index) + " returned null"));
+        } catch (RuntimeException e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
+
+    // One request on the wire; deadline may be null.
+    private CompletableFuture<Object> send(MethodDescriptor method, Object[] args, Deadline deadline,
+            Map<String, String> headers) {
         if (closed) {
             return CompletableFuture.failedFuture(new ConnectionClosedException("client closed"));
         }
@@ -123,7 +161,7 @@ public final class RpcClient implements AutoCloseable {
             }
         }
         CallTable table = tables.computeIfAbsent(physical, c -> new CallTable(c, maxInFlight, completer));
-        CompletableFuture<Response> response = table.call(method.id(), timeoutNanos, Map.of(), payload);
+        CompletableFuture<Response> response = table.call(method.id(), timeoutNanos, headers, payload);
         if (response.isCompletedExceptionally() && connection.current() != physical) {
             // physical closed between current() and computeIfAbsent, so this table may have missed its sweep.
             tables.remove(physical, table);
@@ -199,6 +237,7 @@ public final class RpcClient implements AutoCloseable {
         private Serializer serializer = new RecordSerializer();
         private int maxInFlight = DEFAULT_MAX_IN_FLIGHT;
         private Duration defaultTimeout;
+        private final List<ClientInterceptor> interceptors = new ArrayList<>();
 
         private Builder(NioTransport transport, SocketAddress address) {
             this.transport = Objects.requireNonNull(transport, "transport");
@@ -225,6 +264,12 @@ public final class RpcClient implements AutoCloseable {
                 throw new IllegalArgumentException("timeout must be positive: " + timeout);
             }
             this.defaultTimeout = timeout;
+            return this;
+        }
+
+        /** Adds an interceptor around every call. The first one added is the outermost. */
+        public Builder intercept(ClientInterceptor interceptor) {
+            interceptors.add(Objects.requireNonNull(interceptor, "interceptor"));
             return this;
         }
 

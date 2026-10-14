@@ -23,4 +23,16 @@
         <Method name="current"/>
         <Bug pattern="EI_EXPOSE_REP"/>
     </Match>
+    <!--
+      ClientCall and ServerCall hand interceptors the service's Method. It's
+      the JDK's own reflection handle for that method, not state of ours.
+    -->
+    <Match>
+        <Or>
+            <Class name="dev.rpc.core.ClientCall"/>
+            <Class name="dev.rpc.core.ServerCall"/>
+        </Or>
+        <Field name="method"/>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+    </Match>
 </FindBugsFilter>

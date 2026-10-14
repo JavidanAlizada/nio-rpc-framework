@@ -10,21 +10,27 @@ package dev.rpc.core;
  */
 public final class RpcContext {
 
-    private static final ThreadLocal<Deadline> DEADLINE = new ThreadLocal<>();
+    private static final ThreadLocal<ServerCall> CURRENT = new ThreadLocal<>();
 
     private RpcContext() {
     }
 
-    /** The deadline of the server call running on this thread, or null if there is none. */
-    public static Deadline deadline() {
-        return DEADLINE.get();
+    /** The server call running on this thread, or null. */
+    public static ServerCall current() {
+        return CURRENT.get();
     }
 
-    static void enter(Deadline deadline) {
-        DEADLINE.set(deadline);
+    /** The deadline of the server call running on this thread, or null if there is none. */
+    public static Deadline deadline() {
+        ServerCall call = CURRENT.get();
+        return call == null ? null : call.deadline();
+    }
+
+    static void enter(ServerCall call) {
+        CURRENT.set(call);
     }
 
     static void exit() {
-        DEADLINE.remove();
+        CURRENT.remove();
     }
 }

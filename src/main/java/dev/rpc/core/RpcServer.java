@@ -9,7 +9,9 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Method;
 import java.net.SocketAddress;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
@@ -75,6 +77,7 @@ public final class RpcServer implements AutoCloseable {
         private final Map<Integer, Dispatcher.Entry> table = new HashMap<>();
         private Serializer serializer = new RecordSerializer();
         private int maxConcurrent = DEFAULT_MAX_CONCURRENT;
+        private final List<ServerInterceptor> interceptors = new ArrayList<>();
         private boolean bound;
 
         private Builder(Transport transport) {
@@ -102,6 +105,13 @@ public final class RpcServer implements AutoCloseable {
             return this;
         }
 
+        /** Adds an interceptor around every call. The first one added is the outermost. */
+        public Builder intercept(ServerInterceptor interceptor) {
+            checkNotBound();
+            interceptors.add(Objects.requireNonNull(interceptor, "interceptor"));
+            return this;
+        }
+
         public Builder serializer(Serializer serializer) {
             this.serializer = Objects.requireNonNull(serializer, "serializer");
             return this;
@@ -126,7 +136,8 @@ public final class RpcServer implements AutoCloseable {
             ExecutorService executor = Executors.newThreadPerTaskExecutor(
                     Thread.ofVirtual().name("rpc-call-", 0).factory());
             ScheduledExecutorService timers = Timers.create("rpc-server-deadlines");
-            var dispatcher = new Dispatcher(Map.copyOf(table), serializer, executor, timers, maxConcurrent);
+            var dispatcher = new Dispatcher(Map.copyOf(table), serializer, executor, timers,
+                    List.copyOf(interceptors), maxConcurrent);
             try {
                 return new RpcServer(transport.bind(address, dispatcher), dispatcher, executor, timers);
             } catch (RuntimeException e) {

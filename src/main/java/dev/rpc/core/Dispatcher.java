@@ -12,6 +12,8 @@ import dev.rpc.transport.ConnectionClosedException;
 import dev.rpc.transport.ConnectionHandler;
 import java.lang.System.Logger.Level;
 import java.lang.invoke.MethodHandle;
+import java.lang.reflect.UndeclaredThrowableException;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -37,17 +39,19 @@ final class Dispatcher implements ConnectionHandler {
     private final Serializer serializer;
     private final ExecutorService executor;
     private final ScheduledExecutorService timers;
+    private final List<ServerInterceptor> interceptors;
     private final int maxConcurrent;
     // Running calls per connection, by request id. A call leaves its map when its work really ends, so the map's
     // size bounds the threads a connection holds. Also the set of connections close() has to close.
     private final ConcurrentHashMap<Connection, Map<Integer, RunningCall>> running = new ConcurrentHashMap<>();
 
     Dispatcher(Map<Integer, Entry> table, Serializer serializer, ExecutorService executor,
-            ScheduledExecutorService timers, int maxConcurrent) {
+            ScheduledExecutorService timers, List<ServerInterceptor> interceptors, int maxConcurrent) {
         this.table = table;
         this.serializer = serializer;
         this.executor = executor;
         this.timers = timers;
+        this.interceptors = interceptors;
         this.maxConcurrent = maxConcurrent;
     }
 
@@ -138,9 +142,10 @@ final class Dispatcher implements ConnectionHandler {
             return;
         }
         Object result;
-        RpcContext.enter(call.deadline());
+        var info = new ServerCall(method.method(), request.headers(), call.deadline());
+        RpcContext.enter(info);
         try {
-            result = entry.handle().invokeExact(args);
+            result = proceed(0, entry, info, args);
         } catch (Throwable t) {
             finish(connection, calls, call, thrown(id, method, t));
             rethrowIfFatal(t);
@@ -166,6 +171,19 @@ final class Dispatcher implements ConnectionHandler {
                 }
             });
         }
+    }
+
+    private Object proceed(int index, Entry entry, ServerCall call, Object[] args) throws Exception {
+        if (index == interceptors.size()) {
+            try {
+                return entry.handle().invokeExact(args);
+            } catch (Exception | Error e) {
+                throw e;
+            } catch (Throwable t) {
+                throw new UndeclaredThrowableException(t);
+            }
+        }
+        return interceptors.get(index).intercept(call, args, a -> proceed(index + 1, entry, call, a));
     }
 
     private Response success(int id, MethodDescriptor method, Object value) {

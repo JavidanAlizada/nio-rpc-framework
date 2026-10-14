@@ -4,6 +4,7 @@ import dev.rpc.protocol.Status;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
@@ -28,7 +29,8 @@ final class StubHandler implements InvocationHandler {
         MethodDescriptor remote = service.forMethod(method);
         if (remote != null) {
             Deadline own = timeout == null ? null : Deadline.after(timeout);
-            CompletableFuture<Object> call = client.call(remote, args, Deadline.earliest(own, RpcContext.deadline()));
+            var info = new ClientCall(method, Map.of(), Deadline.earliest(own, RpcContext.deadline()));
+            CompletableFuture<Object> call = client.invoke(remote, info, args);
             return remote.async() ? call : await(call);
         }
         if (method.isDefault()) {
