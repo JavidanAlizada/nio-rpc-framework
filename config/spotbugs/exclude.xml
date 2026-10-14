@@ -14,4 +14,13 @@
         <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
         <Field name="payload"/>
     </Match>
+    <!--
+      ReconnectingConnection.current() hands out the live physical connection
+      on purpose: the RPC client keys its pending calls by it (doc 05, AO).
+    -->
+    <Match>
+        <Class name="dev.rpc.transport.ReconnectingConnection"/>
+        <Method name="current"/>
+        <Bug pattern="EI_EXPOSE_REP"/>
+    </Match>
 </FindBugsFilter>

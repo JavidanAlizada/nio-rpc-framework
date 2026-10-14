@@ -48,6 +48,14 @@ public final class ReconnectingConnection implements Connection, AutoCloseable {
         return observed;
     }
 
+    /**
+     * The physical connection open right now, or null. The handler's events name this connection, so a caller that
+     * tracks per-connection state reads it once and both records and writes against it.
+     */
+    public Connection current() {
+        return current;
+    }
+
     /** Throws ConnectionClosedException at once unless CONNECTED. */
     @Override
     public void write(Frame frame) {
