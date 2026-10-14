@@ -2,6 +2,7 @@ package dev.rpc.core;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -14,17 +15,43 @@ import java.util.concurrent.atomic.AtomicBoolean;
 final class RunningCall {
 
     private final int requestId;
+    private final Deadline deadline;
     private final AtomicBoolean replied = new AtomicBoolean();
     private volatile Future<?> task;
     private volatile CompletableFuture<?> async;
     private volatile boolean cancelled;
+    private volatile ScheduledFuture<?> timer;
+    private volatile boolean finished;
 
-    RunningCall(int requestId) {
+    RunningCall(int requestId, Deadline deadline) {
         this.requestId = requestId;
+        this.deadline = deadline;
     }
 
     int requestId() {
         return requestId;
+    }
+
+    /** null when the client set no deadline. */
+    Deadline deadline() {
+        return deadline;
+    }
+
+    // Same volatile handshake as cancel() and returnedFuture(): a timer set after the call finished is cancelled here.
+    void deadlineTimer(ScheduledFuture<?> timer) {
+        this.timer = timer;
+        if (finished) {
+            timer.cancel(false);
+        }
+    }
+
+    /** The work has ended, however it ended. */
+    void finished() {
+        finished = true;
+        ScheduledFuture<?> t = timer;
+        if (t != null) {
+            t.cancel(false);
+        }
     }
 
     void started(Future<?> task) {

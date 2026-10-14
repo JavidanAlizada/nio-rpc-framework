@@ -18,6 +18,8 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * The server's connection handler. On the loop it only looks the method up and checks the connection's limit; the
@@ -34,15 +36,18 @@ final class Dispatcher implements ConnectionHandler {
     private final Map<Integer, Entry> table;
     private final Serializer serializer;
     private final ExecutorService executor;
+    private final ScheduledExecutorService timers;
     private final int maxConcurrent;
     // Running calls per connection, by request id. A call leaves its map when its work really ends, so the map's
     // size bounds the threads a connection holds. Also the set of connections close() has to close.
     private final ConcurrentHashMap<Connection, Map<Integer, RunningCall>> running = new ConcurrentHashMap<>();
 
-    Dispatcher(Map<Integer, Entry> table, Serializer serializer, ExecutorService executor, int maxConcurrent) {
+    Dispatcher(Map<Integer, Entry> table, Serializer serializer, ExecutorService executor,
+            ScheduledExecutorService timers, int maxConcurrent) {
         this.table = table;
         this.serializer = serializer;
         this.executor = executor;
+        this.timers = timers;
         this.maxConcurrent = maxConcurrent;
     }
 
@@ -93,15 +98,31 @@ final class Dispatcher implements ConnectionHandler {
                     maxConcurrent + " calls already running on this connection"));
             return;
         }
-        var call = new RunningCall(request.requestId());
+        // Measured from when the loop read the Request, so waiting for a thread counts against it.
+        Deadline deadline = request.timeoutNanos() == 0 ? null : Deadline.afterNanos(request.timeoutNanos());
+        var call = new RunningCall(request.requestId(), deadline);
         // Ids only repeat after 2^32 calls, so a put never replaces a call that's still running.
         calls.put(call.requestId(), call);
         try {
             call.started(executor.submit(() -> invoke(connection, calls, call, entry, request)));
+            if (deadline != null) {
+                call.deadlineTimer(timers.schedule(() -> expire(connection, call, entry.method()),
+                        request.timeoutNanos(), TimeUnit.NANOSECONDS));
+            }
         } catch (RejectedExecutionException e) {
             // The server is closing.
             calls.remove(call.requestId(), call);
+            call.claimReply();
+            call.cancel();
             connection.close();
+        }
+    }
+
+    private static void expire(Connection connection, RunningCall call, MethodDescriptor method) {
+        if (call.claimReply()) {
+            call.cancel();
+            reply(connection, Response.error(call.requestId(), Status.DEADLINE_EXCEEDED, "DeadlineExceeded",
+                    "the caller's deadline passed while " + method + " was running"));
         }
     }
 
@@ -117,12 +138,15 @@ final class Dispatcher implements ConnectionHandler {
             return;
         }
         Object result;
+        RpcContext.enter(call.deadline());
         try {
             result = entry.handle().invokeExact(args);
         } catch (Throwable t) {
             finish(connection, calls, call, thrown(id, method, t));
             rethrowIfFatal(t);
             return;
+        } finally {
+            RpcContext.exit();
         }
         if (!method.async()) {
             finish(connection, calls, call, success(id, method, result));
@@ -170,6 +194,7 @@ final class Dispatcher implements ConnectionHandler {
     private static void finish(Connection connection, Map<Integer, RunningCall> calls, RunningCall call,
             Response response) {
         calls.remove(call.requestId(), call);
+        call.finished();
         if (call.claimReply()) {
             reply(connection, response);
         }

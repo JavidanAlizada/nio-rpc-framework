@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -33,11 +34,14 @@ public final class RpcServer implements AutoCloseable {
     private final Server server;
     private final Dispatcher dispatcher;
     private final ExecutorService executor;
+    private final ScheduledExecutorService timers;
 
-    private RpcServer(Server server, Dispatcher dispatcher, ExecutorService executor) {
+    private RpcServer(Server server, Dispatcher dispatcher, ExecutorService executor,
+            ScheduledExecutorService timers) {
         this.server = server;
         this.dispatcher = dispatcher;
         this.executor = executor;
+        this.timers = timers;
     }
 
     public static Builder builder(Transport transport) {
@@ -56,6 +60,7 @@ public final class RpcServer implements AutoCloseable {
     public void close() {
         server.close();
         dispatcher.closeConnections();
+        timers.shutdownNow();
         executor.shutdownNow();
         try {
             executor.awaitTermination(10, TimeUnit.SECONDS);
@@ -120,11 +125,13 @@ public final class RpcServer implements AutoCloseable {
             bound = true;
             ExecutorService executor = Executors.newThreadPerTaskExecutor(
                     Thread.ofVirtual().name("rpc-call-", 0).factory());
-            var dispatcher = new Dispatcher(Map.copyOf(table), serializer, executor, maxConcurrent);
+            ScheduledExecutorService timers = Timers.create("rpc-server-deadlines");
+            var dispatcher = new Dispatcher(Map.copyOf(table), serializer, executor, timers, maxConcurrent);
             try {
-                return new RpcServer(transport.bind(address, dispatcher), dispatcher, executor);
+                return new RpcServer(transport.bind(address, dispatcher), dispatcher, executor, timers);
             } catch (RuntimeException e) {
                 executor.shutdown();
+                timers.shutdown();
                 throw e;
             }
         }

@@ -13,11 +13,17 @@ import dev.rpc.transport.NioTransport;
 import dev.rpc.transport.ReconnectingConnection;
 import java.lang.reflect.Proxy;
 import java.net.SocketAddress;
+import java.time.Duration;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Calls one server endpoint through stubs of its service interfaces. Every stub shares one connection, which
@@ -34,18 +40,21 @@ public final class RpcClient implements AutoCloseable {
 
     private final Serializer serializer;
     private final int maxInFlight;
+    private final Duration defaultTimeout;
+    private final ScheduledExecutorService timers = Timers.create("rpc-client-deadlines");
     private final ReconnectingConnection connection;
     // One table per physical connection: a call must wait in the table of the connection it was written to.
     private final ConcurrentHashMap<Connection, CallTable> tables = new ConcurrentHashMap<>();
     private final Executor completer;
     private volatile boolean closed;
 
-    private RpcClient(NioTransport transport, SocketAddress address, Serializer serializer, int maxInFlight) {
-        this.serializer = serializer;
-        this.maxInFlight = maxInFlight;
+    private RpcClient(Builder builder) {
+        this.serializer = builder.serializer;
+        this.maxInFlight = builder.maxInFlight;
+        this.defaultTimeout = builder.defaultTimeout;
         ThreadFactory threads = Thread.ofVirtual().name("rpc-complete-", 0).factory();
         this.completer = task -> threads.newThread(task).start();
-        this.connection = transport.reconnecting(address, new Handler());
+        this.connection = builder.transport.reconnecting(builder.address, new Handler());
     }
 
     public static RpcClient connect(NioTransport transport, SocketAddress address) {
@@ -56,11 +65,19 @@ public final class RpcClient implements AutoCloseable {
         return new Builder(transport, address);
     }
 
-    /** A stub for type. Fails here, not on the first call, if type can't be called remotely. */
+    /** A stub for type with the client's default timeout. Fails here, not on its first call, if type can't be used. */
     public <T> T stub(Class<T> type) {
+        return stub(type, defaultTimeout);
+    }
+
+    /** A stub for type whose calls each get timeout (null for none), or less if the calling server call has less. */
+    public <T> T stub(Class<T> type, Duration timeout) {
+        if (timeout != null && (timeout.isNegative() || timeout.isZero())) {
+            throw new IllegalArgumentException("timeout must be positive: " + timeout);
+        }
         ServiceDescriptor service = ServiceDescriptor.of(type);
         Object proxy = Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] {type},
-                new StubHandler(this, service));
+                new StubHandler(this, service, timeout));
         return type.cast(proxy);
     }
 
@@ -74,6 +91,7 @@ public final class RpcClient implements AutoCloseable {
         closed = true;
         connection.close();
         tables.values().forEach(CallTable::close);
+        timers.shutdownNow();
     }
 
     @Override
@@ -81,8 +99,8 @@ public final class RpcClient implements AutoCloseable {
         return "RpcClient[" + connection.remoteAddress() + "]";
     }
 
-    /** Sends one call. Never throws; every failure comes back through the future. */
-    CompletableFuture<Object> call(MethodDescriptor method, Object[] args) {
+    /** Sends one call; deadline may be null. Never throws; every failure comes back through the future. */
+    CompletableFuture<Object> call(MethodDescriptor method, Object[] args, Deadline deadline) {
         if (closed) {
             return CompletableFuture.failedFuture(new ConnectionClosedException("client closed"));
         }
@@ -97,12 +115,22 @@ public final class RpcClient implements AutoCloseable {
         } catch (RuntimeException e) {
             return CompletableFuture.failedFuture(e);
         }
+        long timeoutNanos = 0;
+        if (deadline != null) {
+            timeoutNanos = deadline.remainingNanos();
+            if (timeoutNanos <= 0) {
+                return CompletableFuture.failedFuture(deadlineExceeded(method));
+            }
+        }
         CallTable table = tables.computeIfAbsent(physical, c -> new CallTable(c, maxInFlight, completer));
-        CompletableFuture<Response> response = table.call(method.id(), payload);
+        CompletableFuture<Response> response = table.call(method.id(), timeoutNanos, Map.of(), payload);
         if (response.isCompletedExceptionally() && connection.current() != physical) {
             // physical closed between current() and computeIfAbsent, so this table may have missed its sweep.
             tables.remove(physical, table);
             table.close();
+        }
+        if (deadline != null && !response.isDone()) {
+            expireAt(response, method, timeoutNanos);
         }
         // Runs on the completer thread that completes response, so decoding stays off the event loop.
         CompletableFuture<Object> result = response.thenApply(r -> decode(method, r));
@@ -112,6 +140,22 @@ public final class RpcClient implements AutoCloseable {
             }
         });
         return result;
+    }
+
+    // Failing the future takes the call out of its table, which sends the server a CANCEL.
+    private void expireAt(CompletableFuture<Response> response, MethodDescriptor method, long nanos) {
+        try {
+            ScheduledFuture<?> timer = timers.schedule(
+                    () -> completer.execute(() -> response.completeExceptionally(deadlineExceeded(method))),
+                    nanos, TimeUnit.NANOSECONDS);
+            response.whenComplete((r, e) -> timer.cancel(false));
+        } catch (RejectedExecutionException e) {
+            response.completeExceptionally(new ConnectionClosedException("client closed"));
+        }
+    }
+
+    private static RpcException deadlineExceeded(MethodDescriptor method) {
+        return new RpcException(Status.DEADLINE_EXCEEDED, "deadline passed before " + method + " was answered");
     }
 
     private Object decode(MethodDescriptor method, Response response) {
@@ -154,6 +198,7 @@ public final class RpcClient implements AutoCloseable {
         private final SocketAddress address;
         private Serializer serializer = new RecordSerializer();
         private int maxInFlight = DEFAULT_MAX_IN_FLIGHT;
+        private Duration defaultTimeout;
 
         private Builder(NioTransport transport, SocketAddress address) {
             this.transport = Objects.requireNonNull(transport, "transport");
@@ -174,9 +219,18 @@ public final class RpcClient implements AutoCloseable {
             return this;
         }
 
+        /** The timeout of stubs created without one. None by default: such calls wait until answered or cancelled. */
+        public Builder defaultTimeout(Duration timeout) {
+            if (timeout.isNegative() || timeout.isZero()) {
+                throw new IllegalArgumentException("timeout must be positive: " + timeout);
+            }
+            this.defaultTimeout = timeout;
+            return this;
+        }
+
         /** Starts connecting and returns at once; state() shows when the connection is up. */
         public RpcClient connect() {
-            return new RpcClient(transport, address, serializer, maxInFlight);
+            return new RpcClient(this);
         }
     }
 }

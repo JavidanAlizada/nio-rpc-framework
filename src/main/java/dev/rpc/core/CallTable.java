@@ -49,6 +49,11 @@ final class CallTable {
      * has already failed, and nothing is left pending.
      */
     CompletableFuture<Response> call(int methodId, byte[] payload) {
+        return call(methodId, 0, NO_HEADERS, payload);
+    }
+
+    /** As call(methodId, payload), with the time the caller still waits (0 for no deadline) and headers. */
+    CompletableFuture<Response> call(int methodId, long timeoutNanos, Map<String, String> headers, byte[] payload) {
         if (!connection.isWritable()) {
             return CompletableFuture.failedFuture(new RpcException(Status.OVERLOADED,
                     "connection to " + connection.remoteAddress() + " is backed up"));
@@ -78,7 +83,7 @@ final class CallTable {
             }
         });
         try {
-            connection.write(new Request(id, methodId, 0, NO_HEADERS, payload));
+            connection.write(new Request(id, methodId, timeoutNanos, headers, payload));
         } catch (RuntimeException e) {
             if (pending.remove(id, future)) {
                 future.completeExceptionally(e);

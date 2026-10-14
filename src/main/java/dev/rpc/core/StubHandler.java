@@ -3,6 +3,7 @@ package dev.rpc.core;
 import dev.rpc.protocol.Status;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
@@ -14,17 +15,20 @@ final class StubHandler implements InvocationHandler {
 
     private final RpcClient client;
     private final ServiceDescriptor service;
+    private final Duration timeout;
 
-    StubHandler(RpcClient client, ServiceDescriptor service) {
+    StubHandler(RpcClient client, ServiceDescriptor service, Duration timeout) {
         this.client = client;
         this.service = service;
+        this.timeout = timeout;
     }
 
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
         MethodDescriptor remote = service.forMethod(method);
         if (remote != null) {
-            CompletableFuture<Object> call = client.call(remote, args);
+            Deadline own = timeout == null ? null : Deadline.after(timeout);
+            CompletableFuture<Object> call = client.call(remote, args, Deadline.earliest(own, RpcContext.deadline()));
             return remote.async() ? call : await(call);
         }
         if (method.isDefault()) {
