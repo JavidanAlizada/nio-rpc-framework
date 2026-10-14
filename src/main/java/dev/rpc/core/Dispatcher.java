@@ -18,7 +18,6 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The server's connection handler. On the loop it only looks the method up and checks the connection's limit; the
@@ -36,8 +35,9 @@ final class Dispatcher implements ConnectionHandler {
     private final Serializer serializer;
     private final ExecutorService executor;
     private final int maxConcurrent;
-    // Running calls per connection. Also the set of connections close() has to close.
-    private final ConcurrentHashMap<Connection, AtomicInteger> running = new ConcurrentHashMap<>();
+    // Running calls per connection, by request id. A call leaves its map when its work really ends, so the map's
+    // size bounds the threads a connection holds. Also the set of connections close() has to close.
+    private final ConcurrentHashMap<Connection, Map<Integer, RunningCall>> running = new ConcurrentHashMap<>();
 
     Dispatcher(Map<Integer, Entry> table, Serializer serializer, ExecutorService executor, int maxConcurrent) {
         this.table = table;
@@ -50,74 +50,95 @@ final class Dispatcher implements ConnectionHandler {
     public void onFrame(Connection connection, Frame frame) {
         switch (frame) {
             case Request request -> dispatch(connection, request);
-            case Cancel ignored -> { } // M4
+            case Cancel cancel -> cancel(connection, cancel.requestId());
             default -> throw new ProtocolException("a server doesn't accept " + frame.getClass().getSimpleName());
         }
     }
 
     @Override
     public void onClosed(Connection connection, Throwable cause) {
-        running.remove(connection);
+        Map<Integer, RunningCall> calls = running.remove(connection);
+        if (calls != null) {
+            for (RunningCall call : calls.values()) {
+                // Nobody is left to read a reply.
+                call.claimReply();
+                call.cancel();
+            }
+        }
     }
 
     void closeConnections() {
         running.keySet().forEach(Connection::close);
     }
 
+    private void cancel(Connection connection, int requestId) {
+        Map<Integer, RunningCall> calls = running.get(connection);
+        RunningCall call = calls == null ? null : calls.get(requestId);
+        // The client has dropped the call, so it gets no reply. A call already replying is left alone.
+        if (call != null && call.claimReply()) {
+            call.cancel();
+        }
+    }
+
     private void dispatch(Connection connection, Request request) {
-        AtomicInteger count = running.computeIfAbsent(connection, c -> new AtomicInteger());
+        Map<Integer, RunningCall> calls = running.computeIfAbsent(connection, c -> new ConcurrentHashMap<>());
         Entry entry = table.get(request.methodId());
         if (entry == null) {
             reply(connection, Response.error(request.requestId(), Status.UNKNOWN_METHOD, "UnknownMethod",
                     "no method with id " + request.methodId()));
             return;
         }
-        if (count.get() >= maxConcurrent) {
+        if (calls.size() >= maxConcurrent) {
             reply(connection, Response.error(request.requestId(), Status.OVERLOADED, "Overloaded",
                     maxConcurrent + " calls already running on this connection"));
             return;
         }
-        count.incrementAndGet();
+        var call = new RunningCall(request.requestId());
+        // Ids only repeat after 2^32 calls, so a put never replaces a call that's still running.
+        calls.put(call.requestId(), call);
         try {
-            executor.execute(() -> invoke(connection, count, entry, request));
+            call.started(executor.submit(() -> invoke(connection, calls, call, entry, request)));
         } catch (RejectedExecutionException e) {
             // The server is closing.
-            count.decrementAndGet();
+            calls.remove(call.requestId(), call);
             connection.close();
         }
     }
 
-    private void invoke(Connection connection, AtomicInteger count, Entry entry, Request request) {
+    private void invoke(Connection connection, Map<Integer, RunningCall> calls, RunningCall call, Entry entry,
+            Request request) {
         int id = request.requestId();
         MethodDescriptor method = entry.method();
         Object[] args;
         try {
             args = serializer.deserialize(method.parameterTypes(), request.payload());
         } catch (RuntimeException e) {
-            finish(connection, count, failure(id, Status.BAD_REQUEST, e));
+            finish(connection, calls, call, failure(id, Status.BAD_REQUEST, e));
             return;
         }
         Object result;
         try {
             result = entry.handle().invokeExact(args);
         } catch (Throwable t) {
-            finish(connection, count, thrown(id, method, t));
+            finish(connection, calls, call, thrown(id, method, t));
             rethrowIfFatal(t);
             return;
         }
         if (!method.async()) {
-            finish(connection, count, success(id, method, result));
+            finish(connection, calls, call, success(id, method, result));
         } else if (result == null) {
-            finish(connection, count, Response.error(id, Status.INTERNAL, "NullPointerException",
+            finish(connection, calls, call, Response.error(id, Status.INTERNAL, "NullPointerException",
                     method + " returned null instead of a CompletableFuture"));
         } else {
-            ((CompletableFuture<?>) result).whenComplete((value, error) -> {
+            var future = (CompletableFuture<?>) result;
+            call.returnedFuture(future);
+            future.whenComplete((value, error) -> {
                 if (error == null) {
-                    finish(connection, count, success(id, method, value));
+                    finish(connection, calls, call, success(id, method, value));
                 } else {
                     Throwable t = error instanceof CompletionException && error.getCause() != null
                             ? error.getCause() : error;
-                    finish(connection, count, thrown(id, method, t));
+                    finish(connection, calls, call, thrown(id, method, t));
                 }
             });
         }
@@ -146,9 +167,12 @@ final class Dispatcher implements ConnectionHandler {
         return Response.error(id, status, t.getClass().getName(), Messages.truncate(t.getMessage()));
     }
 
-    private void finish(Connection connection, AtomicInteger count, Response response) {
-        count.decrementAndGet();
-        reply(connection, response);
+    private static void finish(Connection connection, Map<Integer, RunningCall> calls, RunningCall call,
+            Response response) {
+        calls.remove(call.requestId(), call);
+        if (call.claimReply()) {
+            reply(connection, response);
+        }
     }
 
     private static void reply(Connection connection, Response response) {

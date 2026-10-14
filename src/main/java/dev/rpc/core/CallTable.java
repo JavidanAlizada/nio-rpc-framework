@@ -1,5 +1,6 @@
 package dev.rpc.core;
 
+import dev.rpc.protocol.Cancel;
 import dev.rpc.protocol.Request;
 import dev.rpc.protocol.Response;
 import dev.rpc.protocol.Status;
@@ -70,7 +71,12 @@ final class CallTable {
             id = nextId;
         }
         // Registered before the write: the response can arrive before write() returns.
-        future.whenComplete((r, e) -> pending.remove(id, future)); // a cancel() frees the id
+        // Every other way a call ends removes it first, so this removal succeeds only when the caller gave up on it.
+        future.whenComplete((r, e) -> {
+            if (pending.remove(id, future)) {
+                sendCancel(id);
+            }
+        });
         try {
             connection.write(new Request(id, methodId, 0, NO_HEADERS, payload));
         } catch (RuntimeException e) {
@@ -79,6 +85,15 @@ final class CallTable {
             }
         }
         return future;
+    }
+
+    private void sendCancel(int id) {
+        try {
+            connection.write(new Cancel(id));
+        } catch (ConnectionClosedException e) {
+            // The server cancels a closed connection's calls by itself.
+            LOG.log(Level.DEBUG, "not sending CANCEL for request {0}: connection closed", id);
+        }
     }
 
     /** Called on the event loop for each Response that arrives. */
