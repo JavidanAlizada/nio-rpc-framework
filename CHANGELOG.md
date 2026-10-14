@@ -6,6 +6,45 @@ per milestone, not per commit.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-14
+
+### Milestone 3 — RPC core
+
+- `dev.rpc.core`: Java interfaces on top of frames. Public types are
+  `RpcClient`, `RpcServer` (and its builder), `RpcException` and
+  `RemoteException`; everything else is package-private.
+- Method ids: the first 4 bytes of SHA-256 over the interface name, the
+  method name and the schema fingerprints of its parameter and result
+  types. A record that changed shape gives UNKNOWN_METHOD instead of a
+  misread payload. Blocking and `CompletableFuture` forms of a method share
+  an id. Id collisions are rejected at registration and stub creation.
+- Client: one `RpcClient` per endpoint over one reconnecting connection.
+  `client.stub(Type.class)` returns a dynamic proxy; a `CompletableFuture`
+  return is async, anything else blocks. Calls are multiplexed by request
+  id and answered in any order.
+  - Pending calls live in a table per physical connection. Each call
+    completes exactly once, whether a response, the connection closing or
+    `cancel()` gets there first.
+  - At most 1,024 calls in flight per connection (configurable); more, or a
+    connection over its high watermark, fail at once with OVERLOADED.
+  - Futures complete on virtual threads, never on the event loop.
+  - A lost connection surfaces as `ConnectionClosedException`.
+- Server: a virtual thread per call, invoked through a `MethodHandle`. At
+  most 1,024 running calls per connection (configurable), more get
+  OVERLOADED. Services are fixed once the server is bound.
+  - A thrown `Exception` becomes APPLICATION_ERROR (`RemoteException` on
+    the client, with the remote class name and message); an `Error`
+    becomes INTERNAL; bad arguments become BAD_REQUEST. Messages are cut
+    to 65,535 UTF-8 bytes. No stack traces cross the wire, and remote
+    exceptions are never rebuilt by class name.
+  - A frame in the wrong direction is a protocol error and closes the
+    connection.
+- `ReconnectingConnection.current()`, the only change to the transport API.
+- Not in this release (deferred by decision, doc 05 §12): the
+  multiplexing and failure test suite and the README section. Deadlines,
+  cancellation over the wire and interceptors come in M4. Until then, a
+  blocking call to a server that never answers waits forever.
+
 ## [0.2.0] — 2026-10-09
 
 ### Milestone 2 — NIO transport
