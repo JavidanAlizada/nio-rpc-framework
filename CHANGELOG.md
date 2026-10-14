@@ -6,6 +6,38 @@ per milestone, not per commit.
 
 ## [Unreleased]
 
+### Milestone 4 — Deadlines, cancellation, interceptors
+
+- Version is `0.4.0-SNAPSHOT`.
+- **Deadlines.** `RpcClient.Builder.defaultTimeout` and
+  `client.stub(Type, Duration)` (none by default, as in 0.3.0). The time
+  left travels in `Request.timeoutNanos`; the deadline itself never crosses
+  the wire as a timestamp. The client fails the call with
+  DEADLINE_EXCEEDED when it passes. The server measures the deadline from
+  when it read the Request, interrupts the call when it passes and replies
+  DEADLINE_EXCEEDED.
+- **Propagation.** `RpcContext.current()` / `deadline()` describe the
+  server call running on the current thread. Calls a service method makes
+  through an `RpcClient` take the earlier of their own timeout and the
+  caller's deadline. It's a ThreadLocal (one virtual thread per call), so
+  work handed to another thread doesn't inherit it.
+- **Cancellation.** A client call that ends without an answer
+  (`cancel()`, deadline, an interrupted blocking caller) sends a CANCEL
+  frame. The server interrupts the call's thread, cancels the future an
+  async method returned, and sends no reply. A closed server connection
+  cancels its running calls. Interruption is cooperative. A cancelled call
+  keeps counting against the per-connection limit until its thread
+  actually ends.
+- **Interceptors.** `ClientInterceptor` (async, may retry: each
+  `next.proceed` is a new request under the same deadline) and
+  `ServerInterceptor` (runs on the call's virtual thread), with explicit
+  `next`. The first one added is the outermost. `ClientCall` / `ServerCall`
+  give the method, headers and deadline, and `ClientCall.withHeader` /
+  `withDeadline` make modified copies. Cancelling a call cancels whichever
+  attempt is on the wire.
+- Not in this release (deferred by decision, doc 05 §12): tests for the
+  above and the README section.
+
 ## [0.3.0] — 2026-10-14
 
 ### Milestone 3 — RPC core
